@@ -11,6 +11,10 @@ Umgebung:
   FM_SCHLUESSEL      Datenschlüssel (32 Byte, Base64)
   FM_KONFIG          Einstellungen als JSON
   FM_ZIEL            Zielordner (Standard: d)
+  FM_WARTEN          Minuten, die ein Lauf auf neue Stände wartet (Standard 65; 0 = nur ein Durchgang)
+  FM_TAKT            Sekunden zwischen zwei Nachfragen während des Wartens (Standard 120)
+
+Ein Lauf endet, sobald jede Quelle einen neuen Stand geliefert hat oder die Wartezeit vorbei ist.
 """
 import base64
 import datetime as dt
@@ -30,7 +34,7 @@ from email.utils import parsedate_to_datetime
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 KENNUNG = b"FMD1"
 SPALTEN = ["item", "variante", "min", "markt", "s100", "s1000", "menge", "angebote", "neu", "neu_menge", "kurz"]
 
@@ -299,6 +303,49 @@ def stand_zeit(kopf):
 
 
 # ---------------------------------------------------------------- Ablauf
+MAX_FEHLVERSUCHE = 3
+
+
+def zahl_aus(name, standard, konfig):
+    roh = os.environ.get(name)
+    if roh is None or roh.strip() == "":
+        roh = konfig.get(name[3:].lower(), standard)
+    try:
+        return max(0.0, float(roh))
+    except (TypeError, ValueError):
+        return float(standard)
+
+
+def hole_quelle(q, alt, konfig, kopf, felder):
+    """Ein Abruf einer Quelle. Rückgabe: None (unverändert) oder (lm, zeit, zeilen, stat)."""
+    bedingt = dict(kopf)
+    if alt.get("lm"):
+        bedingt["If-Modified-Since"] = alt["lm"]
+    r = hole(konfig["basis"] + q["pfade"][0], konfig.get("parameter"), bedingt)
+    if r.status == 304:
+        return None
+    if r.status != 200:
+        raise FormFehler(f"Status {r.status} {r.fehler}".strip())
+    lm, zeit = stand_zeit(r.kopf)
+    if lm and lm == alt.get("lm"):
+        return None
+    listen = [liste_aus(r.json(), felder)]
+    for pfad in q["pfade"][1:]:
+        x = hole(konfig["basis"] + pfad, konfig.get("parameter"), kopf)
+        if x.status != 200:
+            raise FormFehler(f"Status {x.status} {x.fehler} beim Zusatzabruf".strip())
+        listen.append(liste_aus(x.json(), felder))
+    zeilen, stat = verdichte(listen, felder, alt.get("max_nr"), konfig.get("varianten", "falten"))
+    if stat["eintraege"] and stat["fehlerhaft"] > 0.02 * stat["eintraege"]:
+        raise FormFehler(f"{stat['fehlerhaft']} von {stat['eintraege']} Einträgen haben eine unerwartete Form")
+    if not zeilen and (alt.get("zeilen") or 0) > 0:
+        raise FormFehler("leere Antwort, obwohl der vorige Stand Daten hatte")
+    pruef = hashlib.sha256(repr(zeilen).encode()).hexdigest()[:16]
+    if lm is None and pruef == alt.get("pruef"):
+        return None
+    return lm, zeit, zeilen, stat, pruef
+
+
 def lauf():
     kennung, geheim = os.environ.get("FM_ID", "").strip(), os.environ.get("FM_GEHEIM", "").strip()
     if not kennung or not geheim:
@@ -309,6 +356,8 @@ def lauf():
         felder, quellen = konfig["felder"], konfig["quellen"]
     except Exception:
         raise SystemExit("FM_KONFIG fehlt oder ist kein gültiges JSON.")
+    warten = zahl_aus("FM_WARTEN", 65, konfig) * 60
+    takt = max(1.0, zahl_aus("FM_TAKT", 120, konfig))
     ziel = os.environ.get("FM_ZIEL", "d")
     os.makedirs(ziel, exist_ok=True)
     standdatei = os.path.join(ziel, "stand.json")
@@ -319,64 +368,69 @@ def lauf():
     except Exception:
         alt_text, stand = "", {}
 
+    beginn = time.monotonic()
     token = hole_token(konfig, kennung, geheim)
     kopf = {"Authorization": "Bearer " + token}
-    jetzt = dt.datetime.now(dt.timezone.utc)
-    fehler, neu = 0, 0
-    for q in quellen:
-        k = q["k"]
-        alt = stand.get(k) or {}
-        try:
-            bedingt = dict(kopf)
-            if alt.get("lm"):
-                bedingt["If-Modified-Since"] = alt["lm"]
-            r = hole(konfig["basis"] + q["pfade"][0], konfig.get("parameter"), bedingt)
-            if r.status == 304:
-                sag(f"Quelle {k}: unverändert")
+    offen = [q["k"] for q in quellen]          # Quellen, die in diesem Lauf noch keinen neuen Stand geliefert haben
+    fehlversuche = {k: 0 for k in offen}
+    letzter_fehler = {}
+    neu, durchgang = 0, 0
+    while True:
+        durchgang += 1
+        for q in quellen:
+            k = q["k"]
+            if k not in offen or fehlversuche[k] >= MAX_FEHLVERSUCHE:
                 continue
-            if r.status != 200:
-                raise FormFehler(f"Status {r.status} {r.fehler}".strip())
-            lm, zeit = stand_zeit(r.kopf)
-            listen = [liste_aus(r.json(), felder)]
-            for pfad in q["pfade"][1:]:
-                x = hole(konfig["basis"] + pfad, konfig.get("parameter"), kopf)
-                if x.status != 200:
-                    raise FormFehler(f"Status {x.status} {x.fehler} beim Zusatzabruf".strip())
-                listen.append(liste_aus(x.json(), felder))
-            zeilen, stat = verdichte(listen, felder, alt.get("max_nr"), konfig.get("varianten", "falten"))
-            if stat["eintraege"] and stat["fehlerhaft"] > 0.02 * stat["eintraege"]:
-                raise FormFehler(f"{stat['fehlerhaft']} von {stat['eintraege']} Einträgen haben eine unerwartete Form")
-            if not zeilen and (alt.get("zeilen") or 0) > 0:
-                raise FormFehler("leere Antwort, obwohl der vorige Stand Daten hatte")
-            pruef = hashlib.sha256(repr(zeilen).encode()).hexdigest()[:16]
-            if lm is None and pruef == alt.get("pruef"):
-                sag(f"Quelle {k}: unverändert (kein Zeitstempel, gleicher Inhalt)")
-                continue
-            zeit = zeit or jetzt
-            pfad = os.path.join(ziel, zeit.strftime("%Y-%m"), zeit.strftime("%d"), f"{zeit.strftime('%H%M')}-{k}.bin")
-            meta = {"q": k, "stand": zeit.strftime("%Y-%m-%dT%H:%M:%SZ"), "abruf": jetzt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-                    "eintraege": stat["eintraege"], "ohne_preis": stat["ohne_preis"], "erster": int(alt.get("max_nr") is None)}
-            if os.path.exists(pfad):
-                sag(f"Quelle {k}: Stand {zeit.strftime('%d.%m. %H:%M')} liegt schon vor")
-            else:
-                roh = verschluessele(packe(zeilen, meta), schluessel)
-                os.makedirs(os.path.dirname(pfad), exist_ok=True)
-                with open(pfad, "wb") as f:
-                    f.write(roh)
-                neu += 1
-                sag(f"Quelle {k}: neuer Stand {zeit.strftime('%d.%m. %H:%M')} UTC, {stat['eintraege']} Einträge, {len(zeilen)} Zeilen, {len(roh) / 1024:.0f} KB")
-            stand[k] = {"lm": lm, "max_nr": stat["max_nr"], "zeilen": len(zeilen), "pruef": pruef, "stand": meta["stand"]}
-        except FormFehler as e:
-            fehler += 1
-            sag(f"Quelle {k}: FEHLER - {e}")
-        except Exception as e:                                   # nichts Unerwartetes darf Zugangsdaten ins Protokoll bringen
-            fehler += 1
-            sag(f"Quelle {k}: FEHLER - {type(e).__name__}")
-    neu_text = json.dumps(stand, indent=1, sort_keys=True)
-    if neu_text != alt_text:
-        with open(standdatei, "w", encoding="utf-8") as f:
-            f.write(neu_text)
-    sag(f"Fertig: {neu} neue Stände, {fehler} Fehler.")
+            alt = stand.get(k) or {}
+            jetzt = dt.datetime.now(dt.timezone.utc)
+            try:
+                erg = hole_quelle(q, alt, konfig, kopf, felder)
+                if erg is None:
+                    if durchgang == 1:
+                        sag(f"Quelle {k}: unverändert")
+                    letzter_fehler.pop(k, None)
+                    continue
+                lm, zeit, zeilen, stat, pruef = erg
+                zeit = zeit or jetzt
+                pfad = os.path.join(ziel, zeit.strftime("%Y-%m"), zeit.strftime("%d"), f"{zeit.strftime('%H%M')}-{k}.bin")
+                meta = {"q": k, "stand": zeit.strftime("%Y-%m-%dT%H:%M:%SZ"), "abruf": jetzt.strftime("%Y-%m-%dT%H:%M:%SZ"),
+                        "eintraege": stat["eintraege"], "ohne_preis": stat["ohne_preis"], "erster": int(alt.get("max_nr") is None)}
+                if os.path.exists(pfad):
+                    sag(f"Quelle {k}: Stand {zeit.strftime('%d.%m. %H:%M')} liegt schon vor")
+                else:
+                    roh = verschluessele(packe(zeilen, meta), schluessel)
+                    os.makedirs(os.path.dirname(pfad), exist_ok=True)
+                    with open(pfad, "wb") as f:
+                        f.write(roh)
+                    neu += 1
+                    sag(f"Quelle {k}: neuer Stand {zeit.strftime('%d.%m. %H:%M')} UTC, {stat['eintraege']} Einträge, {len(zeilen)} Zeilen, {len(roh) / 1024:.0f} KB")
+                stand[k] = {"lm": lm, "max_nr": stat["max_nr"], "zeilen": len(zeilen), "pruef": pruef, "stand": meta["stand"]}
+                offen.remove(k)
+                letzter_fehler.pop(k, None)
+            except FormFehler as e:
+                fehlversuche[k] += 1
+                letzter_fehler[k] = str(e)
+                sag(f"Quelle {k}: FEHLER - {e}")
+            except Exception as e:                               # nichts Unerwartetes darf Zugangsdaten ins Protokoll bringen
+                fehlversuche[k] += 1
+                letzter_fehler[k] = type(e).__name__
+                sag(f"Quelle {k}: FEHLER - {type(e).__name__}")
+        neu_text = json.dumps(stand, indent=1, sort_keys=True)
+        if neu_text != alt_text:
+            with open(standdatei, "w", encoding="utf-8") as f:
+                f.write(neu_text)
+            alt_text = neu_text
+        aktiv = [k for k in offen if fehlversuche[k] < MAX_FEHLVERSUCHE]
+        vergangen = time.monotonic() - beginn
+        if not aktiv or vergangen + takt > warten:
+            break
+        time.sleep(takt)
+
+    for k in offen:
+        if k not in letzter_fehler and warten > 0:
+            sag(f"Quelle {k}: kein neuer Stand innerhalb der Wartezeit")
+    fehler = len(letzter_fehler)
+    sag(f"Fertig: {neu} neue Stände, {fehler} Fehler, {durchgang} {'Durchgang' if durchgang == 1 else 'Durchgänge'}, {(time.monotonic() - beginn) / 60:.1f} Min.")
     return 1 if fehler else 0
 
 
