@@ -14,7 +14,10 @@ Umgebung:
   FM_WARTEN          Minuten, die ein Lauf auf neue Stände wartet (Standard 65; 0 = nur ein Durchgang)
   FM_TAKT            Sekunden zwischen zwei Nachfragen während des Wartens (Standard 120)
 
-Ein Lauf endet, sobald jede Quelle einen neuen Stand geliefert hat oder die Wartezeit vorbei ist.
+Ein Lauf speichert jeden neuen Stand sofort. Er endet, sobald jede Quelle einen frischen Stand geliefert hat
+(höchstens 10 Minuten vor Laufbeginn entstanden) oder die Wartezeit vorbei ist. Ein älterer, noch nicht
+gespeicherter Stand wird mitgenommen, beendet den Lauf aber nicht: Sonst ginge der nächste Stand verloren,
+wenn der folgende Lauf spät startet.
 """
 import base64
 import datetime as dt
@@ -34,7 +37,7 @@ from email.utils import parsedate_to_datetime
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 KENNUNG = b"FMD1"
 SPALTEN = ["item", "variante", "min", "markt", "s100", "s1000", "menge", "angebote", "neu", "neu_menge", "kurz"]
 
@@ -304,6 +307,7 @@ def stand_zeit(kopf):
 
 # ---------------------------------------------------------------- Ablauf
 MAX_FEHLVERSUCHE = 3
+FRISCH = dt.timedelta(minutes=10)
 
 
 def zahl_aus(name, standard, konfig):
@@ -369,11 +373,13 @@ def lauf():
         alt_text, stand = "", {}
 
     beginn = time.monotonic()
+    beginn_uhr = dt.datetime.now(dt.timezone.utc)
     token = hole_token(konfig, kennung, geheim)
     kopf = {"Authorization": "Bearer " + token}
     offen = [q["k"] for q in quellen]          # Quellen, die in diesem Lauf noch keinen neuen Stand geliefert haben
     fehlversuche = {k: 0 for k in offen}
     letzter_fehler = {}
+    gespeichert = set()
     neu, durchgang = 0, 0
     while True:
         durchgang += 1
@@ -405,8 +411,10 @@ def lauf():
                     neu += 1
                     sag(f"Quelle {k}: neuer Stand {zeit.strftime('%d.%m. %H:%M')} UTC, {stat['eintraege']} Einträge, {len(zeilen)} Zeilen, {len(roh) / 1024:.0f} KB")
                 stand[k] = {"lm": lm, "max_nr": stat["max_nr"], "zeilen": len(zeilen), "pruef": pruef, "stand": meta["stand"]}
-                offen.remove(k)
+                gespeichert.add(k)
                 letzter_fehler.pop(k, None)
+                if zeit >= beginn_uhr - FRISCH:
+                    offen.remove(k)
             except FormFehler as e:
                 fehlversuche[k] += 1
                 letzter_fehler[k] = str(e)
@@ -428,7 +436,7 @@ def lauf():
 
     for k in offen:
         if k not in letzter_fehler and warten > 0:
-            sag(f"Quelle {k}: kein neuer Stand innerhalb der Wartezeit")
+            sag(f"Quelle {k}: kein {'weiterer' if k in gespeichert else 'neuer'} Stand innerhalb der Wartezeit")
     fehler = len(letzter_fehler)
     sag(f"Fertig: {neu} neue Stände, {fehler} Fehler, {durchgang} {'Durchgang' if durchgang == 1 else 'Durchgänge'}, {(time.monotonic() - beginn) / 60:.1f} Min.")
     return 1 if fehler else 0
