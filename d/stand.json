@@ -1,23 +1,23 @@
 {
  "a": {
-  "lm": "Fri, 27 Nov 2026 11:21:55 GMT",
-  "max_nr": 301555076,
-  "pruef": "f80e7103ab0894e4",
-  "stand": "2026-11-27T11:21:55Z",
-  "zeilen": 6995
+  "lm": "Fri, 27 Nov 2026 12:21:57 GMT",
+  "max_nr": 302295139,
+  "pruef": "05b4b3c2547c1c6f",
+  "stand": "2026-11-27T12:21:57Z",
+  "zeilen": 7020
  },
  "b": {
-  "lm": "Fri, 27 Nov 2026 11:21:56 GMT",
-  "max_nr": 301555398,
-  "pruef": "5daa6a8b063f6d72",
-  "stand": "2026-11-27T11:21:56Z",
-  "zeilen": 7141
+  "lm": "Fri, 27 Nov 2026 12:21:59 GMT",
+  "max_nr": 302295488,
+  "pruef": "6da21af972d0258c",
+  "stand": "2026-11-27T12:21:59Z",
+  "zeilen": 7138
  },
  "c": {
-  "lm": "Fri, 27 Nov 2026 11:21:46 GMT",
-  "max_nr": 301553216,
-  "pruef": "416c6f830e4fad70",
-  "stand": "2026-11-27T11:21:46Z",
-  "zeilen": 4422
+  "lm": "Fri, 27 Nov 2026 12:21:46 GMT",
+  "max_nr": 302293147,
+  "pruef": "9488cba329575919",
+  "stand": "2026-11-27T12:21:46Z",
+  "zeilen": 4544
  }
 }
